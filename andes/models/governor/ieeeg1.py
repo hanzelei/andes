@@ -245,7 +245,7 @@ class IEEEG1SpeedControl:
                          e_str='vs * HL_zi + UC * HL_zl + UO * HL_zu - vsl',
                          )
 
-        self.v0 = PostInitService(info='Initial valve position')
+        self.v0 = ConstService(info='Initial valve position', v_str='0')
 
         self.IAW = IntegratorAntiWindup(u=self.vsl,
                                         T=1,
@@ -528,47 +528,100 @@ class IEEEG1PWData(IEEEG1Data):
 
 
 class IEEEG1ValvePositionPW:
+    """
+    Piecewise nonlinear gate-to-steam characteristic, per PowerWorld/GE PSLF spec.
+
+    Six (Gv, Pgv) pairs define the breakpoints. Fixed endpoints (0, PMIN) and
+    (PMAX, PMAX) are implicit. All pieces are linear within each interval; slopes
+    (Kgp_i) and y-intercepts (Bgp_i) are precomputed so pieces connect continuously.
+
+    Notes
+    -----
+    ANDES evaluates ConstServices in registration order, not by dependency graph.
+    ``v0`` in ``IEEEG1SpeedControl`` is registered before ``Kgp_i``/``Bgp_i``, so
+    setting ``v0.v_str`` to the inverse piecewise would run before those services are
+    computed and divide by zero. Instead a new ``IAWy0`` ConstService is registered
+    *after* ``Kgp_i``/``Bgp_i`` and is used both to initialize ``IAW_y`` and in the
+    valve-speed governor equation.
+    """
 
     def __init__(self):
 
-        # Define Kgp1-Kgp6 and Pgv1p-Pgv6p. Is this a bad practice?
+        # Slopes (dimensionless pu/pu) of each piecewise linear segment.
+        # Piece 1 goes from (PMIN, PMIN) to (Gv1*PMAX, Pgv1*PMAX).
         self.Kgp1 = ConstService(
-            v_str='(Pgv1 - PMIN / PMAX) / (Gv1 - 0)',
-            info='Gain of #1 piece',
+            v_str='(Pgv1 * PMAX - PMIN) / (Gv1 * PMAX - PMIN)',
+            info='Slope of GV piece 1',
             tex_name='K_{gp1}',
         )
         for i in range(2, 7):
             setattr(self, f'Kgp{i}', ConstService(
                 v_str=f'(Pgv{i} - Pgv{i-1}) / (Gv{i} - Gv{i-1})',
-                info=f'Gain of #{i} piece',
+                info=f'Slope of GV piece {i}',
                 tex_name=f'K_{{gp{i}}}',
             ))
-
         self.Kgp7 = ConstService(
             v_str='(1 - Pgv6) / (1 - Gv6)',
-            info='Gain of #7 piece',
+            info='Slope of GV piece 7',
             tex_name='K_{gp7}',
         )
 
-        self.GV = Piecewise(u=self.IAW_y,
-                            points=('PMIN', 'Gv1 * PMAX', 'Gv2 * PMAX', 'Gv3 * PMAX',
-                                    'Gv4 * PMAX', 'Gv5 * PMAX', 'Gv6 * PMAX'),
-                            funs=('PMIN',
-                                  'IAW_y * Kgp1 * PMAX + 0',
-                                  'IAW_y * Kgp2 * PMAX + Pgv1',
-                                  'IAW_y * Kgp3 * PMAX + Pgv2',
-                                  'IAW_y * Kgp4 * PMAX + Pgv3',
-                                  'IAW_y * Kgp5 * PMAX + Pgv4',
-                                  'IAW_y * Kgp6 * PMAX + Pgv5',
-                                  'IAW_y * Kgp7 * PMAX + Pgv6',
-                                  'PMAX'),
-                            tex_name='G_{V}',
-                            info='steam flow',
-                            )
-        self.GV.y.v_str = 'tm012'
-        self.GV.y.v_iter = self.GV.y.e_str
+        # y-intercepts (pu) ensuring continuity at each breakpoint.
+        # Piece i: GV_y = Kgp_i * IAW_y + Bgp_i
+        self.Bgp1 = ConstService(
+            v_str='PMIN * (1 - Kgp1)',
+            info='Intercept of GV piece 1',
+            tex_name='B_{gp1}',
+        )
+        for i in range(2, 8):
+            setattr(self, f'Bgp{i}', ConstService(
+                v_str=f'(Pgv{i-1} - Kgp{i} * Gv{i-1}) * PMAX',
+                info=f'Intercept of GV piece {i}',
+                tex_name=f'B_{{gp{i}}}',
+            ))
 
-        self.v0.v_str = 'IAW_y'
+        self.GV = Piecewise(
+            u=self.IAW_y,
+            points=('PMIN', 'Gv1 * PMAX', 'Gv2 * PMAX', 'Gv3 * PMAX',
+                    'Gv4 * PMAX', 'Gv5 * PMAX', 'Gv6 * PMAX'),
+            funs=('PMIN',
+                  'Kgp1 * IAW_y + Bgp1',
+                  'Kgp2 * IAW_y + Bgp2',
+                  'Kgp3 * IAW_y + Bgp3',
+                  'Kgp4 * IAW_y + Bgp4',
+                  'Kgp5 * IAW_y + Bgp5',
+                  'Kgp6 * IAW_y + Bgp6',
+                  'Kgp7 * IAW_y + Bgp7',
+                  'PMAX'),
+            tex_name='G_{V}',
+            info='Piecewise gate-to-steam characteristic',
+        )
+
+        # Initial IAW valve position: inverse of GV applied to tm012.
+        # Registered AFTER Kgp_i and Bgp_i so ANDES evaluates them first.
+        # Derived by inverting GV_y = Kgp_i * IAW_y + Bgp_i for each piece.
+        self.IAWy0 = ConstService(
+            v_str=(
+                "Piecewise("
+                "(PMIN, tm012 <= PMIN), "
+                "((tm012 - Bgp1) / Kgp1, tm012 <= Pgv1 * PMAX), "
+                "((tm012 - Bgp2) / Kgp2, tm012 <= Pgv2 * PMAX), "
+                "((tm012 - Bgp3) / Kgp3, tm012 <= Pgv3 * PMAX), "
+                "((tm012 - Bgp4) / Kgp4, tm012 <= Pgv4 * PMAX), "
+                "((tm012 - Bgp5) / Kgp5, tm012 <= Pgv5 * PMAX), "
+                "((tm012 - Bgp6) / Kgp6, tm012 <= Pgv6 * PMAX), "
+                "((tm012 - Bgp7) / Kgp7, True), "
+                "evaluate=False)"
+            ),
+            info='Initial IAW output: inverse GV at tm012',
+            tex_name='IAW_{y0}',
+        )
+
+        # Override IAW state initialization to use IAWy0 (evaluated after Kgp/Bgp).
+        self.IAW_y.v_str = 'IAWy0'
+
+        # Update valve-speed governor equation to reference IAWy0 as the setpoint.
+        self.vs.e_str = 'ue * (LL_y + IAWy0 + paux - IAW_y) / T3 - vs'
 
         self.L4 = Lag(u=self.GV_y, T=self.T4, K=1,
                       info='first process',
@@ -585,24 +638,27 @@ class IEEEG1PWModel(TGBase):
 
 class IEEEG1PW(IEEEG1):
     """
-    UNDER DEVELOPMENT, DO NOT USE!
+    IEEE Type 1 Speed-Governing Model, PowerWorld / GE PSLF variant.
 
-    IEEE Type 1 Speed-Governing Model in PowerWorld.
+    Extends ``IEEEG1`` with a piecewise-linear gate-to-steam characteristic ``GV``
+    matching the PowerWorld IEEEG1/IEEEG1D/IEEEG1_GE specification.
 
-    The IEEEG1 implementation in PowerWorld and GE PSLF models the gate-steam as a nonlinear
-    process.
+    Six breakpoint pairs (Gv1, Pgv1) ... (Gv6, Pgv6) define the characteristic:
+    Gv_i is the gate position fraction and Pgv_i is the corresponding steam flow
+    fraction. Fixed endpoints (0, PMIN) and (PMAX, PMAX) are implicit. Defaults
+    yield a straight-line (identity) characteristic.
 
-    In ANDES implementation, the nonlinear gate-steam `GV` is represented as
-    a piecewise linear function, defined by six points: (Gv1, Pgv1), ..., (Gv6, Pgv6).
+    Developer Notes
+    ---------------
+    The initialization fix requires ``v0`` in ``IEEEG1SpeedControl`` to be a
+    ``ConstService`` (not ``PostInitService``). ``PostInitService`` is evaluated
+    after all model variables are initialized, so ``IAW.y`` (which uses ``v0`` as
+    its initial value) would start at zero and cause a TDS initialization error.
+    The correct ``v0`` is the inverse piecewise function applied to ``tm012``.
 
-    If left unspecified, these points will be linearly interpolated between `PMIN` and `PMAX`,
-    resulting in a straight line.
-
-    References:
-
+    References
+    ----------
     [1] PowerWorld, Governor IEEEG1, IEEEG1D, and IEEEG1_GE.
-    Available at:
-    https://www.powerworld.com/WebHelp/Content/TransientModels_HTML/Governor%20IEEEG1,%20IEEEG1D%20and%20IEEEG1_GE.htm
     """
 
     def __init__(self, system, config):
