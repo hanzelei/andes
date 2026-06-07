@@ -211,6 +211,9 @@ class BaseVar:
         It slicing into DAE due to the contiguous indices.
         """
 
+        if len(self.a) == 0:
+            return
+
         slice_idx = slice(self.a[0], self.a[-1] + 1)
         if self.v_inplace:
             self.v = dae.__dict__[self.v_code][slice_idx]

@@ -919,6 +919,10 @@ class Model:
                 row_idx = self.__dict__[row_name].a
                 col_idx = self.__dict__[col_name].a
 
+                # skip triplets involving variables with no dae address (e.g. DEPENDENT algebs)
+                if len(row_idx) == 0 or len(col_idx) == 0:
+                    continue
+
                 if len(row_idx) != len(col_idx):
                     logger.error(f'row {row_name}, row_idx: {row_idx}')
                     logger.error(f'col {col_name}, col_idx: {col_idx}')

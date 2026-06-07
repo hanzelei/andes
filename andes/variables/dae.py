@@ -343,6 +343,9 @@ class DAE:
 
         self.tpl = dict()  # sparsity templates with constants
 
+        # DAE reduction: model_name → np.ndarray of global dae.y indices (INDEPENDENT algebs only)
+        self.y_ind_map: dict = {}
+
         self._write_append = False  # True if data should be appended when writing to output
         self._lst_written = False
 

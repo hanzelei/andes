@@ -602,15 +602,51 @@ class System:
                                              nvar=len(mdl.states),
                                              collate=mdl.flags.collate,
                                              )
-            yaddr = self.dae.request_address('y', ndevice=ndevice,
-                                             nvar=len(mdl.algebs),
-                                             collate=mdl.flags.collate,
-                                             )
 
             for idx, item in enumerate(mdl.states.values()):
                 item.set_address(xaddr[idx], contiguous=not collate)
-            for idx, item in enumerate(mdl.algebs.values()):
-                item.set_address(yaddr[idx], contiguous=not collate)
+
+            # DAE reduction: only allocate dae.y for INDEPENDENT algebs (if analysis is available)
+            dae_result = getattr(self, '_dae_result', None)
+            mname = mdl.class_name
+            if dae_result is not None and mname in dae_result.reduced_fns:
+                dep_local = {rec.algeb_name for rec in dae_result.dependent.values()
+                             if rec.model_name == mname}
+                ind_names = [name for name in mdl.algebs if name not in dep_local]
+                n_ind = len(ind_names)
+
+                if n_ind > 0:
+                    yaddr = self.dae.request_address('y', ndevice=ndevice,
+                                                     nvar=n_ind,
+                                                     collate=collate)
+                    ind_slot = 0
+                    for name, item in mdl.algebs.items():
+                        if name in dep_local:
+                            item.is_dependent = True
+                            item.n = ndevice  # buffer size for init/formula eval; a stays empty
+                        else:
+                            item.is_dependent = False
+                            item.set_address(yaddr[ind_slot], contiguous=not collate)
+                            ind_slot += 1
+                else:
+                    for item in mdl.algebs.values():
+                        item.is_dependent = True
+                        item.n = ndevice
+
+                # record global dae.y indices for INDEPENDENT algebs of this model
+                ind_global = []
+                for name, item in mdl.algebs.items():
+                    if not getattr(item, 'is_dependent', False):
+                        ind_global.extend(item.a.tolist())
+                self.dae.y_ind_map[mname] = np.array(ind_global, dtype=int)
+
+            else:
+                yaddr = self.dae.request_address('y', ndevice=ndevice,
+                                                 nvar=len(mdl.algebs),
+                                                 collate=mdl.flags.collate,
+                                                 )
+                for idx, item in enumerate(mdl.algebs.values()):
+                    item.set_address(yaddr[idx], contiguous=not collate)
 
         # --- Phase 2: set external variable addresses ---
         # NOTE:
@@ -1193,11 +1229,11 @@ class System:
         """
 
         for var in self._getters['y']:
-            if var.n > 0:
+            if var.n > 0 and len(var.a) > 0:
                 var.v[:] = self.dae.y[var.a]
 
         for var in self._getters['x']:
-            if var.n > 0:
+            if var.n > 0 and len(var.a) > 0:
                 var.v[:] = self.dae.x[var.a]
 
     def connectivity(self, info=True):
@@ -1435,6 +1471,8 @@ class System:
         for var in model.cache.v_adders.values():
             if var.v_code != v_code:
                 continue
+            if len(var.a) == 0:
+                continue
             np.add.at(self.dae.__dict__[v_code], var.a, var.v)
 
         for var in self._setters[v_code]:
@@ -1457,6 +1495,8 @@ class System:
 
         for name in eq_name:
             for var in self._adders[name]:
+                if len(var.a) == 0:
+                    continue
                 np.add.at(self.dae.__dict__[name], var.a, var.e)
             for var in self._setters[name]:
                 np.put(self.dae.__dict__[name], var.a, var.e)
