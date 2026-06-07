@@ -11,6 +11,10 @@ Typical usage (after pflow has run to populate model .v arrays)::
     result = DaeReductionAnalyser.analyse(ss)
     print(result.summary())
 
+    # Phase 3: generate reduced callables (must be called right after analyse())
+    result = DaeReductionAnalyser.generate_reduced_functions(ss, result)
+    # result.reduced_fns['GENROU'].g_reduced_fn(**name_val) → residual tuple
+
 Dict keys are ``"ModelName.algeb_name"`` strings — unique across the whole
 system even when multiple models define an Algeb with the same local name
 (e.g. both TGOV1 and IEEEG1 define ``wref``).
@@ -20,6 +24,8 @@ system even when multiple models define an Algeb with the same local name
   result.independent — Algebs that remain in Newton.
   result.ext_contrib — ExtAlgeb output slots (diagonal=0 in Gy).
   result.eval_order  — topological evaluation order for DEPENDENT Algebs.
+  result.reduced_fns — per-model reduced callables (populated by
+                       generate_reduced_functions()).
 """
 
 from __future__ import annotations
@@ -51,18 +57,42 @@ class AlgebRecord:
 
 
 @dataclass
+class ModelReducedFunctions:
+    """Reduced system callables for one model (populated by Phase 3).
+
+    ``g_reduced_fn(**name_val)`` evaluates residuals for the INDEPENDENT
+    Algebs after all DEPENDENT Algeb symbols have been substituted by their
+    closed-form formulas.  It accepts the same ``{symbol_name: value}``
+    calling convention as ``_lambdify_formula`` callables.
+
+    ``dep_eval_fns[local_name](**name_val)`` evaluates one DEPENDENT Algeb.
+
+    Both sets of functions reference only States, params, EXT_CONTRIB values,
+    and INDEPENDENT Alg values — no circular dependencies.
+    """
+    g_reduced_fn:        Callable | None          # (**kw) → tuple of IND residuals
+    g_reduced_args:      list[str]                # sorted free-symbol names
+    g_reduced_ind_names: list[str]                # IND Algeb names in output order
+    dep_eval_fns:        dict[str, Callable]      # local_name → (**kw) → value
+    dep_eval_args:       dict[str, list[str]]     # local_name → sorted free-sym names
+    n_independent:       int
+    n_dependent:         int
+
+
+@dataclass
 class DaeReductionResult:
     """System-wide classification of all Algebs.
 
     All dicts are keyed by ``"ModelName.algeb_name"`` to avoid collisions
     when multiple models define an Algeb with the same local name.
     """
-    dependent:   dict[str, AlgebRecord] = field(default_factory=dict)
-    independent: dict[str, AlgebRecord] = field(default_factory=dict)
-    ext_contrib: dict[str, AlgebRecord] = field(default_factory=dict)
-    eval_order:  list[str]             = field(default_factory=list)  # qualified keys
-    # errors during analysis: {model_name: error_str}
-    errors:      dict[str, str]        = field(default_factory=dict)
+    dependent:    dict[str, AlgebRecord]         = field(default_factory=dict)
+    independent:  dict[str, AlgebRecord]         = field(default_factory=dict)
+    ext_contrib:  dict[str, AlgebRecord]         = field(default_factory=dict)
+    eval_order:   list[str]                      = field(default_factory=list)
+    errors:       dict[str, str]                 = field(default_factory=dict)
+    # Populated by generate_reduced_functions() — empty until Phase 3 runs
+    reduced_fns:  dict[str, ModelReducedFunctions] = field(default_factory=dict)
 
     def summary(self) -> str:
         n_dep = len(self.dependent)
@@ -319,6 +349,112 @@ def _lambdify_formula(formula: sp.Expr) -> Callable | None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: reduced function builder
+# ---------------------------------------------------------------------------
+
+def _build_model_reduced_functions(
+    model,
+    dep_recs: dict,
+    ind_recs: dict,
+) -> ModelReducedFunctions:
+    """
+    Build ``ModelReducedFunctions`` for one model.
+
+    Must be called while ``model.syms.g_matrix`` and ``model.syms.vars_list``
+    are still populated (i.e., immediately after ``analyse()`` without
+    ``generate_pycode()`` clearing the symbolic data).
+
+    Parameters
+    ----------
+    model :
+        ANDES model with symbolic data already built.
+    dep_recs : dict
+        ``{local_algeb_name: AlgebRecord}`` for DEPENDENT Algebs.
+    ind_recs : dict
+        ``{local_algeb_name: AlgebRecord}`` for INDEPENDENT Algebs.
+
+    Returns
+    -------
+    ModelReducedFunctions
+    """
+    algeb_names = list(model.cache.algebs_and_ext.keys())
+    n_states    = len(model.cache.states_and_ext)
+    algeb_syms  = model.syms.vars_list[n_states:]
+    name_to_sym = {n: s for n, s in zip(algeb_names, algeb_syms)}
+
+    # DEPENDENT symbol → resolved SymPy formula  (formulas reference only
+    # States / params / EXT_CONTRIB; no DEPENDENT Alg symbols remain)
+    dep_subs = {}
+    for name, rec in dep_recs.items():
+        sym = name_to_sym.get(name)
+        if sym is not None and rec.formula_sympy is not None:
+            dep_subs[sym] = rec.formula_sympy
+
+    # INDEPENDENT Algeb names in the order they appear in algeb_names
+    ind_names_ordered = [n for n in algeb_names if n in ind_recs]
+
+    # -----------------------------------------------------------------
+    # g_reduced: substitute DEPENDENT symbols into INDEPENDENT g-rows
+    # -----------------------------------------------------------------
+    g_reduced_exprs: list[sp.Expr] = []
+    for ind_name in ind_names_ordered:
+        idx    = algeb_names.index(ind_name)
+        g_expr = model.syms.g_matrix[idx]
+        g_sub  = g_expr.subs(dep_subs)
+        # Note: sp.simplify omitted here — very slow for large expressions.
+        # Raw substituted form is sufficient for lambdification.
+        g_reduced_exprs.append(g_sub)
+
+    # Collect all free symbols across all reduced residuals
+    all_free_syms = sorted(
+        {s for expr in g_reduced_exprs for s in expr.free_symbols},
+        key=str,
+    )
+    all_free_names = [str(s) for s in all_free_syms]
+
+    if g_reduced_exprs:
+        g_tuple  = sp.Tuple(*g_reduced_exprs)
+        _g_raw   = sp.lambdify(all_free_syms, g_tuple, modules='numpy')
+        def _g_reduced_fn(**kwargs) -> tuple:
+            return _g_raw(*[kwargs[n] for n in all_free_names])
+        _g_reduced_fn.__doc__ = f'g_reduced({", ".join(all_free_names)})'
+    else:
+        # Empty INDEPENDENT core (e.g. TGOV1)
+        def _g_reduced_fn(**kwargs) -> tuple:
+            return ()
+        _g_reduced_fn.__doc__ = 'g_reduced() — empty IND core'
+
+    # -----------------------------------------------------------------
+    # dep_eval functions (already lambdified in analyse(); reuse formula_fn
+    # when available, otherwise lambdify again from formula_sympy)
+    # -----------------------------------------------------------------
+    dep_eval_fns:  dict[str, Callable] = {}
+    dep_eval_args: dict[str, list[str]] = {}
+
+    for name, rec in dep_recs.items():
+        if rec.formula_fn is not None:
+            fn = rec.formula_fn
+        elif rec.formula_sympy is not None:
+            fn = _lambdify_formula(rec.formula_sympy)
+        else:
+            continue
+        dep_eval_fns[name]  = fn
+        dep_eval_args[name] = sorted(
+            [str(s) for s in rec.formula_sympy.free_symbols]
+        ) if rec.formula_sympy is not None else []
+
+    return ModelReducedFunctions(
+        g_reduced_fn        = _g_reduced_fn,
+        g_reduced_args      = all_free_names,
+        g_reduced_ind_names = ind_names_ordered,
+        dep_eval_fns        = dep_eval_fns,
+        dep_eval_args       = dep_eval_args,
+        n_independent       = len(ind_names_ordered),
+        n_dependent         = len(dep_recs),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main analyser
 # ---------------------------------------------------------------------------
 
@@ -443,5 +579,78 @@ class DaeReductionAnalyser:
                     eval_round   = 0,
                     depends_on   = [],
                 )
+
+        return result
+
+    @staticmethod
+    def generate_reduced_functions(
+        system,
+        result: DaeReductionResult,
+        verbose: bool = False,
+    ) -> DaeReductionResult:
+        """
+        Phase 3: generate reduced callable functions for each model.
+
+        Must be called **immediately after** ``analyse()`` while
+        ``model.syms.g_matrix`` / ``model.syms.vars_list`` are still in
+        memory (``generate_pycode()`` may clear them).
+
+        For each model that has classified Algebs the method builds:
+
+        * ``g_reduced_fn(**name_val)`` — residuals for INDEPENDENT Algebs
+          with DEPENDENT symbols fully substituted by their formulas.
+        * ``dep_eval_fns[name](**name_val)`` — evaluation callable for each
+          DEPENDENT Algeb (reused from ``AlgebRecord.formula_fn``).
+
+        Results are stored in ``result.reduced_fns[model_name]`` and the
+        same ``result`` object is returned.
+
+        Parameters
+        ----------
+        system :
+            Fully set-up ANDES system (pflow must have converged).
+        result :
+            ``DaeReductionResult`` returned by ``analyse()``.
+        verbose : bool
+            Print per-model progress to stdout.
+
+        Returns
+        -------
+        DaeReductionResult
+            The same object with ``reduced_fns`` populated.
+        """
+        from collections import defaultdict
+
+        dep_by_model: dict = defaultdict(dict)
+        ind_by_model: dict = defaultdict(dict)
+
+        for key, rec in result.dependent.items():
+            dep_by_model[rec.model_name][rec.algeb_name] = rec
+        for key, rec in result.independent.items():
+            ind_by_model[rec.model_name][rec.algeb_name] = rec
+
+        for mname, model in system.models.items():
+            dep_recs = dep_by_model.get(mname, {})
+            ind_recs = ind_by_model.get(mname, {})
+
+            if not dep_recs and not ind_recs:
+                continue
+
+            if model.syms.g_matrix is None or model.syms.g_matrix.shape[0] == 0:
+                logger.debug('Skipping %s: g_matrix not populated', mname)
+                continue
+
+            if verbose:
+                print(f'  Building reduced functions for {mname} '
+                      f'(DEP={len(dep_recs)}, IND={len(ind_recs)}) ...')
+
+            try:
+                fns = _build_model_reduced_functions(model, dep_recs, ind_recs)
+                result.reduced_fns[mname] = fns
+            except Exception as exc:
+                logger.warning('generate_reduced_functions failed for %s: %s',
+                               mname, exc)
+                if verbose:
+                    print(f'    FAILED: {exc}')
 
         return result
