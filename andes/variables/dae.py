@@ -181,6 +181,22 @@ class DAETimeSeries:
                     if len(indices) == 0:
                         continue
 
+                # On-demand timeseries for DEPENDENT Algebs (DAE reduction).
+                # DEPENDENT Algebs have a=[] and is_dependent=True.  Output
+                # selection is not supported (stored _ys[t] would be a subset).
+                if (len(indices) == 0
+                        and getattr(base_var, 'is_dependent', False)
+                        and self.dae.system.Output.n == 0):
+                    _dae_result = getattr(self.dae.system, '_dae_result', None)
+                    if _dae_result is not None:
+                        from andes.utils.dae_reduction import _compute_dep_timeseries
+                        dep_data = _compute_dep_timeseries(
+                            self.dae.system, _dae_result, base_var)
+                        if a is not None:
+                            dep_data = dep_data[:, a]
+                        out = np.hstack((out, dep_data))
+                    continue
+
             else:
                 if isinstance(base_var, ExtVar):
                     # external algebraic variables

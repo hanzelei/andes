@@ -912,3 +912,183 @@ def propagate_dep_values(system, result: 'DaeReductionResult') -> None:
                     'propagate_dep_values ExtAlgeb %s.%s→%s.%s: %s',
                     mdl.class_name, ext.name, ext.model, ext.src, exc,
                 )
+
+
+def _compute_dep_timeseries(system, dae_result: 'DaeReductionResult',
+                            algeb) -> np.ndarray:
+    """
+    Compute the timeseries for a single DEPENDENT Algeb on demand.
+
+    Called from ``DAETimeSeries.get_data()`` when the requested variable has
+    ``is_dependent=True`` and ``a=[]`` (eliminated from Newton).
+
+    For each stored timestep, restores State and INDEPENDENT Algeb values into
+    the live ``dae.x`` / ``dae.y`` arrays and model ``.v`` buffers, then
+    evaluates the full DEPENDENT formula chain via ``propagate_dep_values()``
+    and collects the target algeb's ``.v``.
+
+    Parameters
+    ----------
+    system : System
+    dae_result : DaeReductionResult
+    algeb : Algeb
+        The DEPENDENT Algeb whose timeseries is requested.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_steps, n_devices)``.
+
+    Notes
+    -----
+    - No caching is performed; every call walks all stored timesteps — O(n_steps).
+    - ``Output`` selection is not supported; the caller guards against it.
+    - After the loop the model state is at the last stored timestep (which
+      equals the final TDS state, so no explicit save/restore is required).
+    """
+    ts = system.dae.ts
+    if not ts._ys:
+        return np.zeros((0, algeb.n))
+
+    m_ind = system.dae.m   # INDEPENDENT Alg count (= size of each _ys[t])
+    results = []
+
+    for t, y_snap in ts._ys.items():
+        # Restore State and INDEPENDENT Alg values to live DAE arrays.
+        system.dae.x[:] = ts._xs[t]
+        system.dae.y[:m_ind] = y_snap
+
+        # Push restored values to model .v buffers (States + INDEPENDENT Algebs
+        # + ExtAlgebs referencing the network — all are in _getters['x']/['y']).
+        system.vars_to_models()
+
+        # Evaluate all DEPENDENT Algeb .v in topological order.
+        propagate_dep_values(system, dae_result)
+
+        results.append(np.array(algeb.v, dtype=float))
+
+    return np.array(results)   # (n_steps, n_devices)
+
+
+def reconstruct_timeseries(system, dae_result: 'DaeReductionResult') -> None:
+    """
+    Reconstruct full Algeb timeseries after a reduced TDS completes.
+
+    During reduced TDS, only INDEPENDENT Algeb values are stored in
+    ``dae.ts._ys``.  This function evaluates DEPENDENT Algeb values for
+    each stored timestep by restoring State + INDEPENDENT Alg values and
+    re-running ``propagate_dep_values()``, then appends the DEPENDENT values
+    to the timeseries.
+
+    After reconstruction:
+
+    - Each eliminated DEPENDENT Algeb's ``.a`` is set to a new address
+      range appended after the current INDEPENDENT Alg block.
+    - ``dae.m`` is extended to include the DEPENDENT slots.
+    - ``dae.y_name`` / ``dae.y_tex_name`` are extended.
+    - ``dae.ts.unpack()`` is called to rebuild ``dae.ts.y``.
+
+    Callers then access DEPENDENT Algeb timeseries via the normal
+    ``dae.ts.get_data(algeb)`` API — ``algeb.a`` now points to valid columns.
+
+    Notes
+    -----
+    - Reconstruction iterates over every stored timestep — O(n_steps).
+    - If ``system.Output.n > 0``, reconstruction is skipped because the
+      stored ``_ys[t]`` are a subset and the full ``dae.y`` cannot be
+      reliably restored.
+    """
+
+    ts = system.dae.ts
+
+    if not ts._ys:
+        return
+
+    if system.Output.n > 0:
+        logger.warning(
+            'DAE reconstruction skipped: Output selection active — '
+            'DEPENDENT Algeb timeseries will not be available.'
+        )
+        return
+
+    # Collect DEPENDENT Algeb records to reconstruct (eval order, eliminated only).
+    dep_order = []
+    for qkey in dae_result.eval_order:
+        mname, lname = qkey.split('.')
+        rec = dae_result.dependent.get(qkey)
+        if rec is None or rec.formula_fn is None:
+            continue
+        mdl = system.models.get(mname)
+        if mdl is None or mdl.n == 0:
+            continue
+        algeb = mdl.algebs.get(lname)
+        if algeb is None:
+            continue
+        if len(getattr(algeb, 'a', [])) > 0:
+            continue   # still has a DAE address — not eliminated, skip
+        dep_order.append((mname, lname, mdl, algeb))
+
+    if not dep_order:
+        logger.debug('reconstruct_timeseries: no eliminated DEPENDENT Algebs found.')
+        return
+
+    # Allocate per-Algeb timeseries storage.
+    dep_ts: dict = {(mn, ln): [] for mn, ln, _, _ in dep_order}
+
+    t_keys = list(ts._xs.keys())
+    m_ind = system.dae.m   # current INDEPENDENT Alg count (= size of _ys[t])
+
+    for t in t_keys:
+        # Restore State values into dae.x and push to model .v buffers.
+        x_snap = ts._xs[t]
+        system.dae.x[:len(x_snap)] = x_snap
+
+        # Restore INDEPENDENT Alg values into dae.y and push to model .v buffers.
+        y_snap = ts._ys[t]
+        system.dae.y[:m_ind] = y_snap
+
+        # vars_to_models() reads dae.y[var.a] for all registered getters
+        # (INDEPENDENT Algebs + ExtAlgebs).
+        system.vars_to_models()
+
+        # Evaluate DEPENDENT .v buffers from current model state.
+        propagate_dep_values(system, dae_result)
+
+        # Collect DEPENDENT values for this step.
+        for mname, lname, mdl, algeb in dep_order:
+            dep_ts[(mname, lname)].append(np.array(algeb.v, dtype=float))
+
+    # Assign new consecutive DAE addresses to eliminated DEPENDENT Algebs.
+    m_start = m_ind
+    for mname, lname, mdl, algeb in dep_order:
+        n_dev = algeb.n
+        algeb.a = np.arange(m_start, m_start + n_dev, dtype=int)
+        m_start += n_dev
+    new_m = m_start
+
+    # Extend dae.m and name arrays.
+    system.dae.m = new_m
+    system.dae.alloc_or_extend_names()   # pads y_name / y_tex_name to new_m
+
+    for mname, lname, mdl, algeb in dep_order:
+        for idx_item, addr in zip(mdl.idx.v, algeb.a):
+            label = f'{lname} {mdl.class_name} {idx_item}'.replace('_', ' ')
+            system.dae.y_name[int(addr)] = label
+            system.dae.y_tex_name[int(addr)] = label
+
+    # Extend each stored _ys[t] snapshot with the DEPENDENT values.
+    for i, t in enumerate(t_keys):
+        dep_concat = np.concatenate([
+            dep_ts[(mn, ln)][i]
+            for mn, ln, _, _ in dep_order
+        ])
+        ts._ys[t] = np.concatenate([ts._ys[t], dep_concat])
+
+    # Rebuild dae.ts.y array from the extended _ys dict.
+    ts.unpack(warn_empty=False)
+
+    logger.info(
+        'DAE reconstruction: %d DEPENDENT Algeb slots appended '
+        '(dae.m %d → %d, %d timesteps).',
+        new_m - m_ind, m_ind, new_m, len(t_keys),
+    )
