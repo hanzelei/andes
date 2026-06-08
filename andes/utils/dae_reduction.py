@@ -54,6 +54,7 @@ class AlgebRecord:
     formula_fn: Callable | None        # lambdified callable; None for non-DEPENDENT
     eval_round: int                    # peeling round (0 for non-peeled)
     depends_on: list[str]             # qualified keys of Algebs this formula uses
+    formula_args: list[str] = field(default_factory=list)  # symbol names for formula_fn
 
 
 @dataclass
@@ -347,6 +348,7 @@ def _lambdify_formula(formula: sp.Expr) -> Callable | None:
             args = [kwargs[n] for n in sym_names]
             return fn(*args)
         _caller.__doc__ = f'formula({", ".join(sym_names)})'
+        _caller.sym_names = sym_names   # inspectable without re-parsing the formula
         return _caller
     except Exception as exc:
         logger.warning('lambdify failed for formula %s: %s', formula, exc)
@@ -588,14 +590,16 @@ class DaeReductionAnalyser:
                     local = rec['name']
                     key   = f'{mname}.{local}'
                     dep_keys = [f'{mname}.{d}' for d in rec['depends_on_algebs']]
+                    fn = formula_fns.get(local)
                     result.dependent[key] = AlgebRecord(
                         model_name   = mname,
                         algeb_name   = local,
                         category     = 'dependent',
                         formula_sympy= resolved[local],
-                        formula_fn   = formula_fns.get(local),
+                        formula_fn   = fn,
                         eval_round   = rec['round'],
                         depends_on   = dep_keys,
+                        formula_args = getattr(fn, 'sym_names', []),
                     )
                     result.eval_order.append(key)
 
@@ -717,10 +721,8 @@ def _build_name_val_arrays(model) -> dict:
     """
     Return ``{symbol_name: array_or_scalar}`` for all devices simultaneously.
 
-    Like ``_build_name_val_ref`` but vectorized — attribute ``.v`` values are
-    returned as-is (numpy arrays of shape ``(ndevice,)`` or scalars), so that
-    lambdified formulas evaluate over all devices in one call via numpy
-    broadcasting.
+    Full scan via ``dir()`` — used as a fallback when ``formula_args`` is not
+    available.  Prefer ``_build_name_val_fast`` for per-step hot-path calls.
     """
     name_val: dict = {}
     for name in dir(model):
@@ -751,6 +753,54 @@ def _build_name_val_arrays(model) -> dict:
                 val = getattr(disc_obj, zattr)
                 if isinstance(val, np.ndarray):
                     name_val[f'{disc_name}_{zattr}'] = val
+
+    return name_val
+
+
+def _build_name_val_fast(model, needed_syms: list) -> dict:
+    """
+    Build ``{symbol_name: value}`` for *only* the symbols a formula needs.
+
+    Looks up each name directly in ``model._input`` (an ``OrderedDict`` that
+    ANDES pre-builds once at setup and keeps live via in-place ``.v`` mutations).
+    For any name missing from ``_input`` (rare: some discrete sub-variables),
+    falls back to direct ``disc_obj`` attribute access.
+
+    O(k) where k = len(needed_syms), vs O(dir(model)) ≈ O(200) for the full
+    scan.  Called on every Newton iteration so this is the hot path.
+    """
+    name_val: dict = {}
+    inp = getattr(model, '_input', None)
+    missing = []
+
+    if inp:
+        for name in needed_syms:
+            val = inp.get(name)
+            if val is None:
+                missing.append(name)
+                continue
+            try:
+                if hasattr(val, '__len__'):
+                    name_val[name] = np.asarray(val, dtype=float)
+                else:
+                    name_val[name] = float(np.real(val))
+            except (TypeError, ValueError):
+                missing.append(name)
+    else:
+        missing = list(needed_syms)
+
+    # Resolve any names not found in _input (usually discrete sub-variables
+    # whose keys may not survive refresh_inputs() as live references).
+    if missing and hasattr(model, 'discrete'):
+        disc_cache: dict = {}
+        for disc_name, disc_obj in model.discrete.items():
+            for zattr in ('z0', 'z1', 'z2', 'zl', 'zu', 'zi'):
+                key = f'{disc_name}_{zattr}'
+                if key in missing and hasattr(disc_obj, zattr):
+                    disc_cache[key] = getattr(disc_obj, zattr)
+        name_val.update(disc_cache)
+
+    return name_val
 
     return name_val
 
@@ -849,7 +899,12 @@ def propagate_dep_values(system, result: 'DaeReductionResult') -> None:
             mdl.s_update_post()
         except Exception:
             pass
-        name_val = _build_name_val_arrays(mdl)
+        # Fast path: look up only the symbols this formula needs from model._input.
+        # Falls back to full dir() scan only when formula_args is unavailable.
+        if rec.formula_args:
+            name_val = _build_name_val_fast(mdl, rec.formula_args)
+        else:
+            name_val = _build_name_val_arrays(mdl)
         try:
             vals = rec.formula_fn(**name_val)
             vals_arr = np.asarray(vals, dtype=float)

@@ -848,6 +848,13 @@ class TDS(BaseRoutine):
                             err=self.mis[-1],
                             )
 
+        # DAE reduction: update DEPENDENT Algeb .v buffers before both f_update
+        # and g_update so State ODEs (f) and residuals (g) see consistent values.
+        dae_result = getattr(system, '_dae_result', None)
+        if dae_result is not None:
+            from andes.utils.dae_reduction import propagate_dep_values
+            propagate_dep_values(system, dae_result)
+
         # evalute the RHS of `f` and check the limiters (anti-windup)
         # 12/08/2020: Moved `l_update_eq` to before `g_update`
         #   because some algebraic variables depend on pegged states.

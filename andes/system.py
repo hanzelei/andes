@@ -1100,14 +1100,6 @@ class System:
         -----
         Like `f_update`, updated values have not collected into DAE at the end of the step.
         """
-        # DAE reduction: populate DEPENDENT Algeb .v buffers from current State
-        # values before residual evaluation.  This must happen every Newton step
-        # so that INDEPENDENT residuals see correct DEPENDENT values.
-        dae_result = getattr(self, '_dae_result', None)
-        if dae_result is not None:
-            from andes.utils.dae_reduction import propagate_dep_values
-            propagate_dep_values(self, dae_result)
-
         try:
             self.call_models('g_update', models)
         except TypeError as e:
