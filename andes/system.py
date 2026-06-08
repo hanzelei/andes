@@ -866,6 +866,13 @@ class System:
             self.vars_to_dae(mdl)
             self.vars_to_models()
 
+            # DAE reduction: propagate DEPENDENT values immediately after each
+            # model initialises so the next model's ExtAlgebs see correct values.
+            dae_result = getattr(self, '_dae_result', None)
+            if dae_result is not None:
+                from andes.utils.dae_reduction import propagate_dep_values
+                propagate_dep_values(self, dae_result)
+
         self.s_update_post(models)
 
         # store time constants associated with differential equations
@@ -1093,6 +1100,14 @@ class System:
         -----
         Like `f_update`, updated values have not collected into DAE at the end of the step.
         """
+        # DAE reduction: populate DEPENDENT Algeb .v buffers from current State
+        # values before residual evaluation.  This must happen every Newton step
+        # so that INDEPENDENT residuals see correct DEPENDENT values.
+        dae_result = getattr(self, '_dae_result', None)
+        if dae_result is not None:
+            from andes.utils.dae_reduction import propagate_dep_values
+            propagate_dep_values(self, dae_result)
+
         try:
             self.call_models('g_update', models)
         except TypeError as e:
@@ -1140,6 +1155,58 @@ class System:
                         logger.error(f'{mdl.class_name}: j_name {j_name}, row={rows}, col={cols}, val={vals}, '
                                      f'j_size={j_size}')
                         raise e
+
+        # Schur-complement correction Jacobian values from DAE reduction.
+        # Adds ∂(g_reduced - g_orig)/∂sym for each INDEPENDENT Algeb row and
+        # each non-DEPENDENT symbol that has a DAE address.  These entries were
+        # added to the sparsity pattern by store_sparse_pattern(); here we fill
+        # their values.
+        _dae_result = getattr(self, '_dae_result', None)
+        if _dae_result is not None:
+            from andes.utils.dae_reduction import _build_name_val_arrays
+            for _mname, _fns in _dae_result.reduced_fns.items():
+                if not _fns.corr_jac_entries:
+                    continue
+                _mdl = self.models.get(_mname)
+                if _mdl is None or _mdl.n == 0:
+                    continue
+                _name_val = _build_name_val_arrays(_mdl)
+                for _ind_name, _sym_name, _deriv_fn in _fns.corr_jac_entries:
+                    _ind_var = _mdl.algebs.get(_ind_name)
+                    if _ind_var is None or len(_ind_var.a) == 0:
+                        continue
+                    _sym_var = _mdl.__dict__.get(_sym_name)
+                    if _sym_var is None:
+                        continue
+                    _sym_a = getattr(_sym_var, 'a', [])
+                    if len(_sym_a) == 0:
+                        continue
+                    _ind_a = _ind_var.a
+                    if len(_ind_a) != len(_sym_a):
+                        continue
+                    if _sym_name in _mdl.cache.states_and_ext:
+                        _jname = 'gx'
+                    elif _sym_name in _mdl.cache.algebs_and_ext:
+                        _jname = 'gy'
+                    else:
+                        continue
+                    try:
+                        _vals = _deriv_fn(**_name_val)
+                        _vals_arr = np.asarray(_vals, dtype=float).ravel()
+                        if _vals_arr.ndim == 0 or len(_vals_arr) == 1 and len(_ind_a) > 1:
+                            _vals_arr = np.full(len(_ind_a), float(_vals_arr.flat[0]))
+                        _j_size = self.dae.get_size(_jname)
+                        _rows_int = [int(x) for x in _ind_a]
+                        _cols_int = [int(x) for x in _sym_a]
+                        if self.config.ipadd:
+                            self.dae.__dict__[_jname].ipadd(
+                                list(_vals_arr), _rows_int, _cols_int)
+                        else:
+                            self.dae.__dict__[_jname] += spmatrix(
+                                list(_vals_arr), _rows_int, _cols_int, _j_size, 'd')
+                    except Exception as _exc:
+                        logger.debug('j_update reduction corr %s.%s d/d%s: %s',
+                                     _mname, _ind_name, _sym_name, _exc)
 
         self.j_islands()
 
@@ -1205,6 +1272,45 @@ class System:
                     ii.extend(row)
                     jj.extend(col)
                     vv.extend(val * np.ones_like(row))
+
+            # Schur-complement correction entries from DAE reduction.
+            # These add (or extend) Jacobian entries that are missing from the
+            # original model triplets because DEPENDENT Algeb columns were
+            # eliminated.  Adding them here ensures the pattern includes new
+            # non-zeros introduced by the chain-rule substitution.
+            _dae_result = getattr(self, '_dae_result', None)
+            if _dae_result is not None:
+                for _mname, _fns in _dae_result.reduced_fns.items():
+                    if not _fns.corr_jac_entries:
+                        continue
+                    _mdl = self.models.get(_mname)
+                    if _mdl is None or _mdl.n == 0:
+                        continue
+                    for _ind_name, _sym_name, _ in _fns.corr_jac_entries:
+                        _ind_var = _mdl.algebs.get(_ind_name)
+                        if _ind_var is None or len(_ind_var.a) == 0:
+                            continue
+                        _sym_var = _mdl.__dict__.get(_sym_name)
+                        if _sym_var is None:
+                            continue
+                        _sym_a = getattr(_sym_var, 'a', [])
+                        if len(_sym_a) == 0:
+                            continue
+                        # Route to gx (State col) or gy (Algeb col)
+                        if _sym_name in _mdl.cache.states_and_ext:
+                            _entry_jname = 'gx'
+                        elif _sym_name in _mdl.cache.algebs_and_ext:
+                            _entry_jname = 'gy'
+                        else:
+                            continue  # param/service — no Jacobian column
+                        if _entry_jname != jname:
+                            continue
+                        _ind_a = _ind_var.a
+                        if len(_ind_a) != len(_sym_a):
+                            continue
+                        ii.extend(_ind_a)
+                        jj.extend(_sym_a)
+                        vv.extend(np.zeros(len(_ind_a)))
 
             if len(ii) > 0:
                 ii = np.array(ii, dtype=int)

@@ -1009,10 +1009,13 @@ class Model:
         if callable(self.calls.g):
             g_ret = self.calls.g(*self.g_args)
             for i, var in enumerate(self.cache.algebs_and_ext.values()):
+                gi = np.asarray(g_ret[i])
+                if len(var.e) != gi.size and gi.size > 0:
+                    continue   # DEPENDENT Algeb / broken ExtAlgeb — no DAE slot
                 if var.e_inplace:
-                    var.e += g_ret[i]
+                    var.e += gi
                 else:
-                    var.e[:] = g_ret[i]
+                    var.e[:] = gi
 
         kwargs = self.get_inputs()
         # numerical calls defined in the model
@@ -1037,15 +1040,23 @@ class Model:
         for jname, jfunc in self.calls.j.items():
             ret = jfunc(*self.j_args[jname])
 
-            for idx, fun in enumerate(self.calls.vjac[jname]):
+            triplet_idx = 0
+            for idx in range(len(self.calls.vjac[jname])):
+                row_name, col_name = self._jac_eq_var_name(jname, idx)
+                row_var = self.__dict__.get(row_name)
+                col_var = self.__dict__.get(col_name)
+                # Mirror build_jac_val(): skip entries where row or col has no DAE
+                # address (e.g. DEPENDENT Algeb); those triplets were never appended.
+                if (row_var is None or len(getattr(row_var, 'a', [])) == 0 or
+                        col_var is None or len(getattr(col_var, 'a', [])) == 0):
+                    continue
                 try:
-                    self.triplets.vjac[jname][idx][:] = ret[idx]
+                    self.triplets.vjac[jname][triplet_idx][:] = ret[idx]
                 except (ValueError, IndexError, FloatingPointError) as e:
-                    row_name, col_name = self._jac_eq_var_name(jname, idx)
                     logger.error('%s: error calculating or storing Jacobian <%s>: j_idx=%s, d%s / d%s',
                                  self.class_name, jname, idx, row_name, col_name)
-
                     raise e
+                triplet_idx += 1
 
     def get_times(self):
         """

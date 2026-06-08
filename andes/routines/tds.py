@@ -213,6 +213,12 @@ class TDS(BaseRoutine):
         system.store_no_check_init(models=system.exist.pflow_tds)
         system.vars_to_models()
 
+        # DAE reduction: fix ExtAlgeb shapes for DEPENDENT sources so that
+        # shape-mismatch crashes in system.init() are prevented.
+        if hasattr(system, '_dae_result'):
+            from andes.utils.dae_reduction import fix_dep_ext_algeb_shapes
+            fix_dep_ext_algeb_shapes(system, system._dae_result)
+
         system.init(system.exist.tds, routine='tds')
 
         self.fg_update(system.exist.tds, init=True)

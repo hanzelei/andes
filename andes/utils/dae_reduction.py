@@ -77,6 +77,11 @@ class ModelReducedFunctions:
     dep_eval_args:       dict[str, list[str]]     # local_name → sorted free-sym names
     n_independent:       int
     n_dependent:         int
+    # Schur-complement correction Jacobian entries (Phase 5).
+    # Each entry is (ind_algeb_name, sym_name, deriv_fn) where deriv_fn(**name_val)
+    # evaluates ∂(g_reduced - g_orig)/∂sym for all devices.  These are the missing
+    # coupling terms that arise when DEPENDENT Algeb columns are eliminated from Newton.
+    corr_jac_entries:    list                     # [(ind_name, sym_name, fn), ...]
 
 
 @dataclass
@@ -425,6 +430,40 @@ def _build_model_reduced_functions(
         _g_reduced_fn.__doc__ = 'g_reduced() — empty IND core'
 
     # -----------------------------------------------------------------
+    # Correction Jacobian (Schur complement)
+    # corr_k = g_reduced_k - g_orig_k  for each INDEPENDENT Algeb k.
+    # ∂corr_k/∂sym is the missing coupling added back to the Newton Jacobian
+    # for every non-DEPENDENT symbol sym that has a DAE address.
+    # -----------------------------------------------------------------
+    dep_sym_names = set(dep_recs.keys())
+    corr_entries: list = []   # (ind_algeb_name, sym_name, deriv_fn)
+
+    for k, ind_name in enumerate(ind_names_ordered):
+        idx_k  = algeb_names.index(ind_name)
+        g_orig = model.syms.g_matrix[idx_k]
+        g_red  = g_reduced_exprs[k]
+        try:
+            corr = g_red - g_orig
+        except Exception:
+            continue
+        if corr == 0:
+            continue
+
+        for sym in sorted(corr.free_symbols, key=str):
+            sname = str(sym)
+            if sname in dep_sym_names:
+                continue   # DEPENDENT Algeb — column has no DAE address
+            try:
+                deriv = sp.diff(corr, sym)
+                if deriv == 0:
+                    continue
+            except Exception:
+                continue
+            deriv_fn = _lambdify_formula(deriv)
+            if deriv_fn is not None:
+                corr_entries.append((ind_name, sname, deriv_fn))
+
+    # -----------------------------------------------------------------
     # dep_eval functions (already lambdified in analyse(); reuse formula_fn
     # when available, otherwise lambdify again from formula_sympy)
     # -----------------------------------------------------------------
@@ -451,6 +490,7 @@ def _build_model_reduced_functions(
         dep_eval_args       = dep_eval_args,
         n_independent       = len(ind_names_ordered),
         n_dependent         = len(dep_recs),
+        corr_jac_entries    = corr_entries,
     )
 
 
@@ -500,85 +540,98 @@ class DaeReductionAnalyser:
             # These values are used for nonlinear root selection (e.g. psi2 sign).
             name_val_ref = _build_name_val_ref(model, device_idx=0)
 
-            # Rebuild symbolic data (may have been cleared for cached pycode)
+            # Rebuild symbolic data (may have been cleared for cached pycode).
+            # generate_equations() and generate_jacobians() overwrite calls.f/g/j
+            # with lambdify versions that lack the 4 select_args in their
+            # signatures — incompatible with the pycode-loaded versions.
+            # Save the full set of affected attributes and restore after analysis.
+            _saved_calls = {
+                'f':              model.calls.f,
+                'g':              model.calls.g,
+                'f_args':         list(model.calls.f_args),
+                'g_args':         list(model.calls.g_args),
+                'j':              dict(model.calls.j),
+                'j_args':         {k: list(v) for k, v in model.calls.j_args.items()},
+                'ijac':           {k: list(v) for k, v in model.calls.ijac.items()},
+                'jjac':           {k: list(v) for k, v in model.calls.jjac.items()},
+                'vjac':           {k: list(v) for k, v in model.calls.vjac.items()},
+                'j_names':        list(model.calls.j_names),
+                'need_diag_eps':  list(model.calls.need_diag_eps),
+            }
             try:
                 model.syms.generate_symbols()
                 model.syms.generate_equations()
                 model.syms.generate_jacobians()
-            except Exception as exc:
-                logger.warning('Symbolic rebuild failed for %s: %s', mname, exc)
-                result.errors[mname] = f'symbolic rebuild: {exc}'
-                continue
 
-            if model.syms.dg_syms.shape == (0, 0):
-                continue
+                if model.syms.dg_syms.shape == (0, 0):
+                    continue
 
-            # Algeb-Algeb Jacobian sub-block
-            n_states = len(model.cache.states_and_ext)
-            jac_gg   = model.syms.dg_syms[:, n_states:]
+                # Algeb-Algeb Jacobian sub-block
+                n_states = len(model.cache.states_and_ext)
+                jac_gg   = model.syms.dg_syms[:, n_states:]
 
-            # Iterative peeling
-            try:
+                # Iterative peeling
                 eval_order, ind_core, ext_contrib = _iterative_peel(
                     model, jac_gg, name_val_ref)
-            except Exception as exc:
-                logger.warning('Peeling failed for %s: %s', mname, exc)
-                result.errors[mname] = f'peeling: {exc}'
-                continue
 
-            # Resolve DEPENDENT formulas to State/param-only form
-            try:
+                # Resolve DEPENDENT formulas to State/param-only form
                 resolved = _resolve_formulas(eval_order)
+
+                # Lambdify resolved formulas
+                formula_fns: dict[str, Callable | None] = {
+                    name: _lambdify_formula(formula)
+                    for name, formula in resolved.items()
+                }
+
+                # Record results — key = "ModelName.algeb_name" to avoid collisions
+                for rec in eval_order:
+                    local = rec['name']
+                    key   = f'{mname}.{local}'
+                    dep_keys = [f'{mname}.{d}' for d in rec['depends_on_algebs']]
+                    result.dependent[key] = AlgebRecord(
+                        model_name   = mname,
+                        algeb_name   = local,
+                        category     = 'dependent',
+                        formula_sympy= resolved[local],
+                        formula_fn   = formula_fns.get(local),
+                        eval_round   = rec['round'],
+                        depends_on   = dep_keys,
+                    )
+                    result.eval_order.append(key)
+
+                for local in ind_core:
+                    key = f'{mname}.{local}'
+                    result.independent[key] = AlgebRecord(
+                        model_name   = mname,
+                        algeb_name   = local,
+                        category     = 'independent',
+                        formula_sympy= None,
+                        formula_fn   = None,
+                        eval_round   = 0,
+                        depends_on   = [],
+                    )
+
+                for local in ext_contrib:
+                    key = f'{mname}.{local}'
+                    result.ext_contrib[key] = AlgebRecord(
+                        model_name   = mname,
+                        algeb_name   = local,
+                        category     = 'ext_contrib',
+                        formula_sympy= None,
+                        formula_fn   = None,
+                        eval_round   = 0,
+                        depends_on   = [],
+                    )
+
             except Exception as exc:
-                logger.warning('Formula resolution failed for %s: %s', mname, exc)
-                result.errors[mname] = f'resolution: {exc}'
-                continue
+                logger.warning('Analysis failed for %s: %s', mname, exc)
+                result.errors[mname] = str(exc)
 
-            # Lambdify resolved formulas
-            formula_fns: dict[str, Callable | None] = {
-                name: _lambdify_formula(formula)
-                for name, formula in resolved.items()
-            }
-
-            # Record results — key = "ModelName.algeb_name" to avoid collisions
-            for rec in eval_order:
-                local = rec['name']
-                key   = f'{mname}.{local}'
-                dep_keys = [f'{mname}.{d}' for d in rec['depends_on_algebs']]
-                result.dependent[key] = AlgebRecord(
-                    model_name   = mname,
-                    algeb_name   = local,
-                    category     = 'dependent',
-                    formula_sympy= resolved[local],
-                    formula_fn   = formula_fns.get(local),
-                    eval_round   = rec['round'],
-                    depends_on   = dep_keys,
-                )
-                result.eval_order.append(key)
-
-            for local in ind_core:
-                key = f'{mname}.{local}'
-                result.independent[key] = AlgebRecord(
-                    model_name   = mname,
-                    algeb_name   = local,
-                    category     = 'independent',
-                    formula_sympy= None,
-                    formula_fn   = None,
-                    eval_round   = 0,
-                    depends_on   = [],
-                )
-
-            for local in ext_contrib:
-                key = f'{mname}.{local}'
-                result.ext_contrib[key] = AlgebRecord(
-                    model_name   = mname,
-                    algeb_name   = local,
-                    category     = 'ext_contrib',
-                    formula_sympy= None,
-                    formula_fn   = None,
-                    eval_round   = 0,
-                    depends_on   = [],
-                )
+            finally:
+                # Restore all calls attributes overwritten by generate_equations()
+                # and generate_jacobians(), so TDS uses the pycode-loaded functions.
+                for _k, _v in _saved_calls.items():
+                    setattr(model.calls, _k, _v)
 
         return result
 
@@ -654,3 +707,208 @@ class DaeReductionAnalyser:
                     print(f'    FAILED: {exc}')
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: runtime helpers for reduced TDS integration
+# ---------------------------------------------------------------------------
+
+def _build_name_val_arrays(model) -> dict:
+    """
+    Return ``{symbol_name: array_or_scalar}`` for all devices simultaneously.
+
+    Like ``_build_name_val_ref`` but vectorized — attribute ``.v`` values are
+    returned as-is (numpy arrays of shape ``(ndevice,)`` or scalars), so that
+    lambdified formulas evaluate over all devices in one call via numpy
+    broadcasting.
+    """
+    name_val: dict = {}
+    for name in dir(model):
+        if name.startswith('_'):
+            continue
+        try:
+            obj = getattr(model, name)
+        except Exception:
+            continue
+        if not hasattr(obj, 'v'):
+            continue
+        val = obj.v
+        if val is None:
+            continue
+        try:
+            if hasattr(val, '__len__'):
+                name_val[name] = np.asarray(val, dtype=float)
+            else:
+                name_val[name] = float(np.real(val))
+        except (TypeError, ValueError):
+            pass
+
+    if hasattr(model, 'discrete'):
+        for disc_name, disc_obj in model.discrete.items():
+            for zattr in ('z0', 'z1', 'z2', 'zl', 'zu', 'zi'):
+                if not hasattr(disc_obj, zattr):
+                    continue
+                val = getattr(disc_obj, zattr)
+                if isinstance(val, np.ndarray):
+                    name_val[f'{disc_name}_{zattr}'] = val
+
+    return name_val
+
+
+def fix_dep_ext_algeb_shapes(system, result: 'DaeReductionResult') -> None:
+    """
+    Repair the shape of ExtAlgebs that reference DEPENDENT source variables.
+
+    After ``set_address()`` with DAE reduction, ``link_external`` raises
+    IndexError for ExtAlgebs whose source has ``a = []``.  This leaves the
+    ExtAlgeb with ``n=0``, ``v=zeros(0)``, which causes shape-mismatch crashes
+    in ``s_update`` during ``system.init()``.
+
+    This sets ``.n`` and ``.v`` to the correct number of devices (zero values).
+    Call ``propagate_dep_values`` afterwards to fill correct values.
+
+    Handles both direct model references (``ext.model = 'GENROU'``) and group
+    references (``ext.model = 'SynGen'``).  The check is: if ``ext.n == 0`` but
+    the indexer has devices, the ExtAlgeb was silently broken by DEPENDENT
+    source, so fix the shape.
+    """
+    for mdl in system.models.values():
+        if not hasattr(mdl, 'algebs_ext'):
+            continue
+        for ext in mdl.algebs_ext.values():
+            if ext.n != 0:
+                continue   # already has correct shape
+            # Determine expected number of devices from the indexer
+            try:
+                if ext.indexer is not None:
+                    idx_v = ext.indexer.v
+                    if hasattr(idx_v, '__len__'):
+                        n_expected = len(idx_v)
+                    else:
+                        n_expected = 0
+                else:
+                    n_expected = 0
+            except Exception:
+                n_expected = 0
+
+            if n_expected == 0:
+                continue   # nothing to fix
+
+            # The ExtAlgeb has n=0 but indexer says there should be devices —
+            # this means link_external failed because the source is DEPENDENT.
+            ext.n = n_expected
+            ext.v = np.zeros(n_expected)
+            ext.e = np.zeros(n_expected)   # also fix .e so g_update doesn't crash
+            logger.debug(
+                'fix_dep_ext_algeb_shapes: %s.%s → size %d',
+                mdl.class_name, ext.name, n_expected,
+            )
+
+
+def propagate_dep_values(system, result: 'DaeReductionResult') -> None:
+    """
+    Evaluate DEPENDENT Algeb ``.v`` buffers in topological order, then copy
+    values to ExtAlgeb readers that reference DEPENDENT sources.
+
+    Call this:
+
+    * Inside ``system.init()`` after each model's init cycle (see the hook in
+      ``System.init()``), so the next model's ExtAlgebs receive correct values.
+    * At the start of ``System.g_update()`` each Newton step, to keep DEPENDENT
+      values consistent with current State / INDEPENDENT Algeb values.
+    """
+    # Step A: evaluate DEPENDENT Algeb .v in topological order.
+    # Guards:
+    # (1) Only models that are initialized — uninitialized models have their
+    #     DEPENDENT .v set to 0 so that v_str_add=True works correctly during
+    #     the model's own init() call.  After init(), Step A runs again and
+    #     overwrites with the formula result.
+    # (2) Only algebs that are truly eliminated from Newton (a=[]).
+    #     Algebs with a valid DAE address (PFlow-only models skipped by
+    #     set_address()) get their .v from vars_to_models(); overwriting with
+    #     the formula may produce divide-by-zero when limiters are inactive.
+    for qkey in result.eval_order:
+        mname, lname = qkey.split('.')
+        mdl = system.models[mname]
+        if mdl.n == 0:
+            continue
+        if not getattr(mdl.flags, 'initialized', False):
+            continue  # guard (1): skip uninitialized models
+        rec = result.dependent[qkey]
+        if rec.formula_fn is None:
+            continue
+        algeb = mdl.algebs.get(lname)
+        if algeb is None:
+            continue
+        if len(getattr(algeb, 'a', [])) > 0:
+            continue  # guard (2): still has DAE address → vars_to_models() handles it
+        # Refresh PostInitServices (e.g. vref0) so their .v is current before
+        # building the name-val dict.  s_update_post() is normally called after
+        # ALL models are initialised, but here we need it before the formula runs.
+        try:
+            mdl.s_update_post()
+        except Exception:
+            pass
+        name_val = _build_name_val_arrays(mdl)
+        try:
+            vals = rec.formula_fn(**name_val)
+            vals_arr = np.asarray(vals, dtype=float)
+            if vals_arr.ndim == 0:
+                algeb.v[:] = float(vals_arr)
+            elif vals_arr.shape == algeb.v.shape:
+                algeb.v[:] = vals_arr
+            else:
+                algeb.v[:] = vals_arr.ravel()[:len(algeb.v)]
+        except Exception as exc:
+            logger.debug('propagate_dep_values %s.%s: %s', mname, lname, exc)
+
+    # Step B: copy DEPENDENT Algeb values to ExtAlgeb readers.
+    # Handles both direct model refs (ext.model = 'GENROU') and Group refs
+    # (ext.model = 'SynGen').  For Groups, use Group.get() which routes to
+    # the correct member model.  We check `is_dependent` on the resolved source
+    # variable to avoid touching non-DEPENDENT ExtAlgebs.
+    dep_keys = result.dependent  # set for fast lookup
+    for mdl in system.models.values():
+        if not hasattr(mdl, 'algebs_ext'):
+            continue
+        for ext in mdl.algebs_ext.values():
+            if len(ext.v) == 0:
+                continue  # shape not yet fixed, nothing to do
+            src_obj = system.__dict__.get(ext.model)
+            if src_obj is None:
+                continue
+            if ext.indexer is None:
+                continue
+            idx_v = ext.indexer.v
+            if not hasattr(idx_v, '__len__') or len(idx_v) == 0:
+                continue
+
+            is_group = hasattr(src_obj, '_idx2model')
+            try:
+                if is_group:
+                    # Group reference — check if src is DEPENDENT in any member
+                    any_dep = any(
+                        f'{m.class_name}.{ext.src}' in dep_keys
+                        for m in src_obj._idx2model.values()
+                    )
+                    if not any_dep:
+                        continue
+                    vals = src_obj.get(ext.src, list(idx_v), attr='v')
+                    ext.v[:] = np.asarray(vals, dtype=float)
+                else:
+                    # Direct model reference
+                    src_var = src_obj.__dict__.get(ext.src)
+                    if src_var is None or not getattr(src_var, 'is_dependent', False):
+                        continue
+                    uid = src_obj.idx2uid(idx_v)
+                    if len(uid) == 0:
+                        continue
+                    if len(ext.v) != len(uid):
+                        ext.n = len(uid)
+                        ext.v = np.zeros(len(uid))
+                    ext.v[:] = src_var.v[uid]
+            except Exception as exc:
+                logger.debug(
+                    'propagate_dep_values ExtAlgeb %s.%s→%s.%s: %s',
+                    mdl.class_name, ext.name, ext.model, ext.src, exc,
+                )
