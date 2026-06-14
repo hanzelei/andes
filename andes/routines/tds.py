@@ -57,7 +57,6 @@ class TDS(BaseRoutine):
                                      ('max_store', 900),
                                      ('save_every', 1),
                                      ('save_mode', 'auto'),
-                                     ('compress_output', 0),
                                      ('no_tqdm', 0),
                                      ('chatter_iter', 4),
                                      ('linesearch', 1),
@@ -96,7 +95,6 @@ class TDS(BaseRoutine):
                               max_store='maximum steps of data stored in memory before offloading',
                               save_every='save one step to memory every N simulation steps',
                               save_mode='automatically or manually save output data when done',
-                              compress_output='use zlib compression for NPZ output (0=fast uncompressed, 1=smaller files)',
                               no_tqdm='disable tqdm progressbar',
                               chatter_iter='minimum iterations to detect chattering',
                               linesearch='nonmonotone backtracking line search',
@@ -131,7 +129,6 @@ class TDS(BaseRoutine):
                               max_store='positive integer',
                               save_every='integer',
                               save_mode=('auto', 'manual'),
-                              compress_output=(0, 1),
                               no_tqdm=(0, 1),
                               chatter_iter='int>=4',
                               linesearch=(0, 1),
@@ -858,6 +855,30 @@ class TDS(BaseRoutine):
 
         self.system.dae.ts.idx_ptr = len(self.system.dae.ts.t)
 
+        return True
+
+    def recompress(self):
+        """
+        Re-compress the NPZ output file with zlib compression.
+
+        Call this after TDS.run() to trade disk space for a smaller file.
+        The uncompressed NPZ written during the run is replaced in-place
+        with a zlib-compressed version.
+
+        Returns
+        -------
+        bool
+            True if the file was recompressed. False if the NPZ does not exist.
+        """
+        import os
+        import numpy as np
+        path = self.system.files.npz
+        if not os.path.exists(path):
+            logger.warning("NPZ file not found: %s", path)
+            return False
+        data = np.load(path)
+        np.savez_compressed(path[:-4], **dict(data))
+        logger.info("Recompressed NPZ saved to %s", path)
         return True
 
     def do_switch(self):
