@@ -880,7 +880,7 @@ class DAE:
 
     def write_npz(self, file_path):
         """
-        Write TDS data into NumPy compressed format.
+        Write TDS data into NumPy format.
 
         The function supports writing out all values at once or writing them out
         incrementally.
@@ -892,13 +892,13 @@ class DAE:
         if not tds.config.limit_store:
             # write the whole TimeSeries in one step
             txyz_data = self.ts.txyz
-            np.savez_compressed(file_path, data=txyz_data)
+            np.savez(file_path, data=txyz_data)
 
         else:
             # create a new npz file and write for the first time
             if self._write_append is False:
                 txyz_data = self.ts.txyz[ts.idx_ptr:, :]
-                np.savez_compressed(file_path, data=txyz_data)
+                np.savez(file_path, data=txyz_data)
                 self._write_append = True
                 ts.idx_ptr = len(self.ts.t)
 
@@ -923,5 +923,5 @@ class DAE:
                 else:
                     data = txyz_data
 
-                np.savez_compressed(file_path, data=data)
+                np.savez(file_path, data=data)
                 ts.idx_ptr = len(self.ts.t)
