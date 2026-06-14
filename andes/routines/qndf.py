@@ -230,6 +230,7 @@ class QNDF:
         use_ls = tds.config.linesearch
         if use_ls:
             merit_history = []
+            _ls_merit_cache = None
 
         tds.fg_update(models=system.exist.pflow_tds)
 
@@ -277,9 +278,9 @@ class QNDF:
                 tds.qg[n:] = dae.g
 
             if not tds.config.linsolve:
-                inc = tds.solver.solve(tds.Ac, matrix(tds.qg))
+                inc = np.array(tds.solver.solve(tds.Ac, matrix(tds.qg))).ravel()
             else:
-                inc = tds.solver.linsolve(tds.Ac, matrix(tds.qg))
+                inc = np.array(tds.solver.linsolve(tds.Ac, matrix(tds.qg))).ravel()
 
             if np.isnan(inc).any():
                 logger.debug("QNDF: NaN in linear solve at t=%.6f, h=%.4g — treating as Newton failure",
@@ -287,33 +288,36 @@ class QNDF:
                 tds.err_msg = 'NaN in linear solve'
                 break
 
+            inc_abs = np.abs(inc)
             if tds.config.reset_tiny:
-                inc[np.where(np.abs(inc) < tds.tol_zero)] = 0
+                inc[inc_abs < tds.tol_zero] = 0
 
             tds.inc = inc
-            mis_arg = np.argmax(np.abs(inc))
+            mis_arg = int(inc_abs.argmax())
             mis_inc = inc[mis_arg]
-            mis_qg_arg = np.argmax(np.abs(tds.qg))
-            mis_qg = tds.qg[mis_qg_arg]
+            mis_qg = float(np.max(np.abs(tds.qg)))
 
             if tds.niter == 0:
-                tds.mis[0] = abs(mis_qg)
+                tds.mis[0] = mis_qg
                 tds.mis_inc[0] = abs(mis_inc)
             else:
                 tds.mis.append(mis_qg)
                 tds.mis_inc.append(mis_inc)
 
-            mis = abs(mis_inc)
+            mis = float(inc_abs[mis_arg])
 
             if tds.niter > tds.config.chatter_iter:
                 if abs(sum(tds.mis_inc[-2:])) < 1e-6 and abs(tds.mis_inc[-1]) > 1e-4:
                     tds.chatter = True
 
-            inc_x = inc[:n].ravel()
-            inc_y = inc[n:n + dae.m].ravel()
+            inc_x = inc[:n]
+            inc_y = inc[n:n + dae.m]
 
             if use_ls:
-                merit_old = np.dot(tds.qg, tds.qg)
+                if _ls_merit_cache is not None:
+                    merit_old = _ls_merit_cache
+                else:
+                    merit_old = float(np.dot(tds.qg, tds.qg))
                 merit_history.append(merit_old)
                 merit_ref = max(merit_history[-3:])
                 tds.xs[:] = dae.x
@@ -333,12 +337,14 @@ class QNDF:
                         tds.qg[n:] = tds.config.g_scale * h * dae.g
                     else:
                         tds.qg[n:] = dae.g
-                    merit_new = np.dot(tds.qg, tds.qg)
+                    merit_new = float(np.dot(tds.qg, tds.qg))
                     if merit_new < merit_ref:
                         break
                     alpha *= 0.5
                     logger.debug("QNDF line search backtrack: alpha=%.4g at t=%.6f",
                                  alpha, dae.t)
+
+                _ls_merit_cache = merit_new
             else:
                 dae.x -= inc_x
                 dae.y -= inc_y

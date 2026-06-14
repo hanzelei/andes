@@ -152,6 +152,7 @@ class ImplicitIter:
         use_ls = tds.config.linesearch
         if use_ls:
             merit_history = []
+            _ls_merit_cache = None
 
         # initial residual evaluation (reused by first iteration)
         tds.fg_update(models=system.exist.pflow_tds)
@@ -207,11 +208,13 @@ class ImplicitIter:
             else:
                 tds.qg[dae.n:] = dae.g
 
-            # calculate variable corrections
+            # calculate variable corrections; convert solver output to numpy 1D
+            # array once so all downstream ops (nan check, tiny reset, slicing)
+            # use fast numpy paths instead of repeated implicit CVXOPT conversions.
             if not tds.config.linsolve:
-                inc = tds.solver.solve(tds.Ac, matrix(tds.qg))
+                inc = np.array(tds.solver.solve(tds.Ac, matrix(tds.qg))).ravel()
             else:
-                inc = tds.solver.linsolve(tds.Ac, matrix(tds.qg))
+                inc = np.array(tds.solver.linsolve(tds.Ac, matrix(tds.qg))).ravel()
 
             # check for np.nan first
             if np.isnan(inc).any():
@@ -221,28 +224,28 @@ class ImplicitIter:
                 break
 
             # reset tiny values to reduce chattering
+            inc_abs = np.abs(inc)
             if tds.config.reset_tiny:
-                inc[np.where(np.abs(inc) < tds.tol_zero)] = 0
+                inc[inc_abs < tds.tol_zero] = 0
 
             # store `inc` to tds for debugging
             tds.inc = inc
 
             # retrieve maximum abs. residual and maximum var. correction
-            mis_arg = np.argmax(np.abs(inc))
+            mis_arg = int(inc_abs.argmax())
             mis_inc = inc[mis_arg]
 
-            mis_qg_arg = np.argmax(np.abs(tds.qg))
-            mis_qg = tds.qg[mis_qg_arg]
+            mis_qg = float(np.max(np.abs(tds.qg)))
 
             # store initial maximum mismatch
             if tds.niter == 0:
-                tds.mis[0] = abs(mis_qg)
+                tds.mis[0] = mis_qg
                 tds.mis_inc[0] = abs(mis_inc)
             else:
                 tds.mis.append(mis_qg)
                 tds.mis_inc.append(mis_inc)
 
-            mis = abs(mis_inc)
+            mis = float(inc_abs[mis_arg])
 
             # chattering detection
             if tds.niter > tds.config.chatter_iter:
@@ -253,11 +256,17 @@ class ImplicitIter:
                     logger.debug("Chattering variable: %s", dae.xy_name[mis_arg])
 
             # --- apply step ---
-            inc_x = inc[:dae.n].ravel()
-            inc_y = inc[dae.n: dae.n + dae.m].ravel()
+            inc_x = inc[:dae.n]
+            inc_y = inc[dae.n: dae.n + dae.m]
 
             if use_ls:
-                merit_old = np.dot(tds.qg, tds.qg)
+                # qg here is identical to the trial-point qg from the previous
+                # NR iteration's line search, so merit_new from that iteration
+                # equals merit_old for this one — reuse it when available.
+                if _ls_merit_cache is not None:
+                    merit_old = _ls_merit_cache
+                else:
+                    merit_old = float(np.dot(tds.qg, tds.qg))
                 merit_history.append(merit_old)
                 merit_ref = max(merit_history[-3:])
 
@@ -282,13 +291,15 @@ class ImplicitIter:
                     else:
                         tds.qg[dae.n:] = dae.g
 
-                    merit_new = np.dot(tds.qg, tds.qg)
+                    merit_new = float(np.dot(tds.qg, tds.qg))
                     if merit_new < merit_ref:
                         break
 
                     alpha *= 0.5
                     logger.debug("TDS line search backtrack: alpha=%.4g at t=%.6f",
                                  alpha, dae.t)
+
+                _ls_merit_cache = merit_new
             else:
                 dae.x -= inc_x
                 dae.y -= inc_y
