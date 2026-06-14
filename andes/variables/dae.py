@@ -888,17 +888,18 @@ class DAE:
 
         tds = self.system.TDS
         ts = self.ts
+        _save = np.savez_compressed if tds.config.compress_output else np.savez
 
         if not tds.config.limit_store:
             # write the whole TimeSeries in one step
             txyz_data = self.ts.txyz
-            np.savez(file_path, data=txyz_data)
+            _save(file_path, data=txyz_data)
 
         else:
             # create a new npz file and write for the first time
             if self._write_append is False:
                 txyz_data = self.ts.txyz[ts.idx_ptr:, :]
-                np.savez(file_path, data=txyz_data)
+                _save(file_path, data=txyz_data)
                 self._write_append = True
                 ts.idx_ptr = len(self.ts.t)
 
@@ -923,5 +924,5 @@ class DAE:
                 else:
                     data = txyz_data
 
-                np.savez(file_path, data=data)
+                _save(file_path, data=data)
                 ts.idx_ptr = len(self.ts.t)
